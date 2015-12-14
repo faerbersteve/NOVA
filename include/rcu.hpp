@@ -20,15 +20,17 @@
 
 #include "compiler.hpp"
 #include "types.hpp"
+#include "stdio.hpp"
 
 class Rcu_elem
 {
     public:
         Rcu_elem *next;
         void (*func)(Rcu_elem *);
+        void (*pre_func)(Rcu_elem *);
 
         ALWAYS_INLINE
-        explicit Rcu_elem (void (*f)(Rcu_elem *)) : next (nullptr), func (f) {}
+        explicit Rcu_elem (void (*f)(Rcu_elem *), void (*pf) (Rcu_elem *) = nullptr) : next (nullptr), func (f), pre_func(pf) {}
 };
 
 class Rcu_list
@@ -36,25 +38,38 @@ class Rcu_list
     public:
         Rcu_elem *  head;
         Rcu_elem ** tail;
+        mword       count;
 
         ALWAYS_INLINE
         explicit Rcu_list() { clear(); }
 
         ALWAYS_INLINE
-        inline void clear() { head = nullptr; tail = &head; }
+        inline void clear() { head = nullptr; tail = &head; count = 0;}
+
+        ALWAYS_INLINE
+        inline bool empty() { return &head == tail || head == nullptr; }
 
         ALWAYS_INLINE
         inline void append (Rcu_list *l)
         {
-           *tail = l->head;
-            tail = l->tail;
+           *tail   = l->head;
+            tail   = l->tail;
+           *tail   = head;
+
+            count += l->count;
             l->clear();
         }
 
         ALWAYS_INLINE
         inline void enqueue (Rcu_elem *e)
         {
-            e->next = nullptr;
+            if (e->next || tail == &e->next) {
+                trace (0, "warning: rcu element already enqueued");
+                return;
+            }
+
+            count ++;
+
            *tail = e;
             tail = &e->next;
         }
@@ -90,7 +105,12 @@ class Rcu
 
     public:
         ALWAYS_INLINE
-        static inline void call (Rcu_elem *e) { next.enqueue (e); }
+        static inline void call (Rcu_elem *e) {
+            if (e->pre_func)
+                e->pre_func(e);
+
+            next.enqueue (e);
+        }
 
         static void quiet();
         static void update();

@@ -6,6 +6,7 @@
  *
  * Copyright (C) 2012-2013 Udo Steinberg, Intel Corporation.
  * Copyright (C) 2014 Udo Steinberg, FireEye, Inc.
+ * Copyright (C) 2014-2015 Alexander Boettcher, Genode Labs GmbH.
  *
  * This file is part of the NOVA microhypervisor.
  *
@@ -22,31 +23,67 @@
 #pragma once
 
 #include "ec.hpp"
+#include "si.hpp"
 
-class Sm : public Kobject, public Queue<Ec>
+class Sm : public Kobject, public Refcount, public Queue<Ec>, public Queue<Si>, public Si
 {
     private:
         mword counter;
+        bool  rcu;
 
         static Slab_cache cache;
 
+        static void free (Rcu_elem * a) {
+            Sm * sm = static_cast <Sm *>(a);
+
+            if (sm->del_ref()) {
+                Pd *pd = static_cast<Pd *>(static_cast<Space_obj *>(sm->space));
+                destroy(sm, pd->quota);
+            } else {
+                sm->rcu = false;
+                sm->up();
+            }
+        }
+
     public:
-        Sm (Pd *, mword, mword = 0);
+
+        mword reset(bool l = false) {
+            if (l) lock.lock();
+            mword c = counter;
+            counter = 0;
+            if (l) lock.unlock();
+            return c;
+        }
+
+        Sm (Pd *, mword, mword = 0, Sm * = nullptr, mword = 0);
+        ~Sm ()
+        {
+            while (!counter)
+                up (Ec::sys_finish<Sys_regs::BAD_CAP, true>);
+        }
 
         ALWAYS_INLINE
-        inline void dn (bool zero, uint64 t)
+        inline void dn (bool zero, uint64 t, Ec *ec = Ec::current, bool block = true)
         {
-            Ec *ec = Ec::current;
-
             {   Lock_guard <Spinlock> guard (lock);
 
                 if (counter) {
                     counter = zero ? 0 : counter - 1;
+
+                    Si * si;
+                    if (Queue<Si>::dequeue(si = Queue<Si>::head()))
+                        ec->set_si_regs(si->value, static_cast <Sm *>(si)->reset());
+
                     return;
                 }
 
-                enqueue (ec);
+                ec->add_ref();
+
+                Queue<Ec>::enqueue (ec);
             }
+
+            if (!block)
+                Sc::schedule (false);
 
             ec->set_timeout (t, this);
 
@@ -54,19 +91,34 @@ class Sm : public Kobject, public Queue<Ec>
         }
 
         ALWAYS_INLINE
-        inline void up()
+        inline void up (void (*c)() = nullptr, Sm * si = nullptr)
         {
             Ec *ec;
 
             {   Lock_guard <Spinlock> guard (lock);
 
-                if (!dequeue (ec = head())) {
+                loop:
+
+                if (!Queue<Ec>::dequeue (ec = Queue<Ec>::head())) {
+
+                    if (si) {
+                       if (si->queued()) return;
+                       Queue<Si>::enqueue(si);
+                    }
+
                     counter++;
                     return;
                 }
+
+                if (EXPECT_FALSE(ec->del_ref())) {
+                    delete ec;
+                    goto loop;
+                }
+
+                if (si) ec->set_si_regs(si->value, si->reset());
             }
 
-            ec->release (Ec::sys_finish<Sys_regs::SUCCESS, true>);
+            ec->release (c);
         }
 
         ALWAYS_INLINE
@@ -74,7 +126,7 @@ class Sm : public Kobject, public Queue<Ec>
         {
             {   Lock_guard <Spinlock> guard (lock);
 
-                if (!dequeue (ec))
+                if (!Queue<Ec>::dequeue (ec))
                     return;
             }
 
@@ -82,8 +134,30 @@ class Sm : public Kobject, public Queue<Ec>
         }
 
         ALWAYS_INLINE
-        static inline void *operator new (size_t) { return cache.alloc(); }
+        inline void call_rcu(bool r = false)
+        {
+            if (ACCESS_ONCE(rcu))
+                return;
+
+            rcu = true;
+
+            if (r)
+                add_ref();
+
+            Rcu::call (this);
+        }
 
         ALWAYS_INLINE
-        static inline void operator delete (void *ptr) { cache.free (ptr); }
+        inline void add_to_rcu()
+        {
+            Lock_guard <Spinlock> guard (lock);
+
+            call_rcu(true);
+        }
+
+        ALWAYS_INLINE
+        static inline void *operator new (size_t, Quota &quota) { return cache.alloc(quota); }
+
+        ALWAYS_INLINE
+        static inline void destroy(Sm *obj, Quota &quota) { obj->~Sm(); cache.free (obj, quota); }
 };
